@@ -1,0 +1,21 @@
+{
+  "name": "img4web",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.11.0",
+    "@types/archiver": "^7.0.0",
+    "archiver": "^7.0.1",
+    "sharp": "^0.34.5"
+  }
+}
