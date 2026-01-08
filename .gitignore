@@ -1,6 +1,13 @@
 # dependencies (bun install)
 node_modules
 
+# test/output files
+test-images/
+*-compressed/
+*-compressed.zip
+img4web-output/
+.img4web-temp-*
+
 # output
 out
 dist
@@ -29,6 +36,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # IntelliJ based IDEs
 .idea
+
+# Cursor
+.cursor/
 
 # Finder (MacOS) folder config
 .DS_Store
