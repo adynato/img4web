@@ -3,43 +3,75 @@ import * as p from "@clack/prompts";
 import sharp from "sharp";
 import { readdir, stat, mkdir } from "fs/promises";
 import { join, basename, extname, dirname, relative } from "path";
+import { $ } from "bun";
 
 const IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".webp", ".avif", ".tiff", ".gif"];
+const VIDEO_EXTS = [".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"];
 
-interface ImageFile {
+interface MediaFile {
   path: string;
   name: string;
   relativePath: string;
   size: number;
+  type: "image" | "video";
   width?: number;
   height?: number;
 }
 
-async function findImages(dir: string, baseDir: string): Promise<ImageFile[]> {
-  const images: ImageFile[] = [];
+async function findMedia(dir: string, baseDir: string): Promise<MediaFile[]> {
+  const media: MediaFile[] = [];
   const entries = await readdir(dir, { withFileTypes: true });
 
   for (const entry of entries) {
     const fullPath = join(dir, entry.name);
 
     if (entry.isDirectory()) {
-      const subImages = await findImages(fullPath, baseDir);
-      images.push(...subImages);
+      const subMedia = await findMedia(fullPath, baseDir);
+      media.push(...subMedia);
     } else {
       const ext = extname(entry.name).toLowerCase();
+      const fileStat = await stat(fullPath);
+
       if (IMAGE_EXTS.includes(ext)) {
-        const fileStat = await stat(fullPath);
-        images.push({
+        media.push({
           path: fullPath,
           name: entry.name,
           relativePath: relative(baseDir, fullPath),
-          size: fileStat.size
+          size: fileStat.size,
+          type: "image"
+        });
+      } else if (VIDEO_EXTS.includes(ext)) {
+        media.push({
+          path: fullPath,
+          name: entry.name,
+          relativePath: relative(baseDir, fullPath),
+          size: fileStat.size,
+          type: "video"
         });
       }
     }
   }
 
-  return images;
+  return media;
+}
+
+async function getVideoDimensions(path: string): Promise<{ width: number; height: number }> {
+  try {
+    const result = await $`ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 ${path}`.text();
+    const [width, height] = result.trim().split("x").map(Number);
+    return { width: width || 0, height: height || 0 };
+  } catch {
+    return { width: 0, height: 0 };
+  }
+}
+
+async function compressVideo(inputPath: string, outputPath: string, maxWidth?: number): Promise<void> {
+  const scaleFilter = maxWidth && maxWidth > 0
+    ? `-vf "scale='min(${maxWidth},iw)':-2"`
+    : "";
+
+  // CRF 28 is good balance for web, -preset fast for speed
+  await $`ffmpeg -y -i ${inputPath} -c:v libx264 -crf 28 -preset fast -c:a aac -b:a 128k ${scaleFilter.length ? scaleFilter.split(" ") : []} ${outputPath}`.quiet();
 }
 
 function formatBytes(bytes: number): string {
@@ -50,6 +82,14 @@ function formatBytes(bytes: number): string {
 
 async function main() {
   p.intro("img4web");
+
+  // Check for ffmpeg
+  let hasFFmpeg = true;
+  try {
+    await $`which ffmpeg`.quiet();
+  } catch {
+    hasFFmpeg = false;
+  }
 
   const input = await p.text({
     message: "Drop a folder",
@@ -79,28 +119,45 @@ async function main() {
     process.exit(1);
   }
 
-  const allImages = await findImages(folderPath, folderPath);
+  const allMedia = await findMedia(folderPath, folderPath);
 
-  if (allImages.length === 0) {
-    p.log.error("No images found");
+  if (allMedia.length === 0) {
+    p.log.error("No images or videos found");
     process.exit(1);
   }
 
-  // Get dimensions for all images
-  for (const img of allImages) {
+  const images = allMedia.filter((m) => m.type === "image");
+  const videos = allMedia.filter((m) => m.type === "video");
+
+  if (videos.length > 0 && !hasFFmpeg) {
+    p.log.warn(`Found ${videos.length} videos but ffmpeg not installed - skipping videos`);
+    videos.length = 0;
+  }
+
+  // Get dimensions for images
+  for (const img of images) {
     const metadata = await sharp(img.path).metadata();
     img.width = metadata.width;
     img.height = metadata.height;
   }
 
-  const totalSize = allImages.reduce((sum, img) => sum + img.size, 0);
-  p.log.info(`Found ${allImages.length} images (${formatBytes(totalSize)})`);
+  // Get dimensions for videos
+  for (const vid of videos) {
+    const dims = await getVideoDimensions(vid.path);
+    vid.width = dims.width;
+    vid.height = dims.height;
+  }
+
+  const totalSize = allMedia.reduce((sum, m) => sum + m.size, 0);
+  const mediaToProcess = [...images, ...videos];
+
+  p.log.info(`Found ${images.length} images, ${videos.length} videos (${formatBytes(totalSize)})`);
 
   const mode = await p.select({
     message: "Mode",
     options: [
       { value: "fast", label: "Fast - compress only, keep dimensions" },
-      { value: "custom", label: "Custom - set dimensions per image" },
+      { value: "custom", label: "Custom - set dimensions per file" },
     ],
   });
 
@@ -120,36 +177,47 @@ async function main() {
     const spinner = p.spinner();
     spinner.start("Processing...");
 
-    for (let i = 0; i < allImages.length; i++) {
-      const img = allImages[i]!;
-      spinner.message(`${img.name} (${i + 1}/${allImages.length})`);
+    for (let i = 0; i < mediaToProcess.length; i++) {
+      const file = mediaToProcess[i]!;
+      spinner.message(`${file.name} (${i + 1}/${mediaToProcess.length})`);
 
-      // Preserve directory structure
-      const outputRelative = img.relativePath.replace(/\.[^.]+$/, ".webp");
-      const outputPath = join(outputDir, outputRelative);
-      await mkdir(dirname(outputPath), { recursive: true });
+      if (file.type === "image") {
+        const outputRelative = file.relativePath.replace(/\.[^.]+$/, ".webp");
+        const outputPath = join(outputDir, outputRelative);
+        await mkdir(dirname(outputPath), { recursive: true });
 
-      await sharp(img.path)
-        .webp({ quality: 75 })
-        .toFile(outputPath);
+        await sharp(file.path)
+          .webp({ quality: 75 })
+          .toFile(outputPath);
 
-      const outputStat = await stat(outputPath);
-      totalOriginal += img.size;
-      totalCompressed += outputStat.size;
+        const outputStat = await stat(outputPath);
+        totalOriginal += file.size;
+        totalCompressed += outputStat.size;
+      } else {
+        const outputRelative = file.relativePath.replace(/\.[^.]+$/, ".mp4");
+        const outputPath = join(outputDir, outputRelative);
+        await mkdir(dirname(outputPath), { recursive: true });
+
+        await compressVideo(file.path, outputPath);
+
+        const outputStat = await stat(outputPath);
+        totalOriginal += file.size;
+        totalCompressed += outputStat.size;
+      }
     }
 
     spinner.stop("Done!");
   } else {
-    // Custom mode - ask per image
-    for (let i = 0; i < allImages.length; i++) {
-      const img = allImages[i]!;
+    // Custom mode - ask per file
+    for (let i = 0; i < mediaToProcess.length; i++) {
+      const file = mediaToProcess[i]!;
 
-      p.log.info(`\n${img.relativePath} - ${img.width}x${img.height} (${formatBytes(img.size)})`);
+      p.log.info(`\n${file.relativePath} - ${file.width}x${file.height} (${formatBytes(file.size)}) [${file.type}]`);
 
       const maxWidth = await p.select({
         message: "Max width",
         options: [
-          { value: 0, label: `Keep original (${img.width}px)` },
+          { value: 0, label: `Keep original (${file.width}px)` },
           { value: 400, label: "400px (thumbnail)" },
           { value: 800, label: "800px (small)" },
           { value: 1200, label: "1200px (medium)" },
@@ -163,27 +231,41 @@ async function main() {
         process.exit(0);
       }
 
-      // Preserve directory structure
-      const outputRelative = img.relativePath.replace(/\.[^.]+$/, ".webp");
-      const outputPath = join(outputDir, outputRelative);
-      await mkdir(dirname(outputPath), { recursive: true });
+      if (file.type === "image") {
+        const outputRelative = file.relativePath.replace(/\.[^.]+$/, ".webp");
+        const outputPath = join(outputDir, outputRelative);
+        await mkdir(dirname(outputPath), { recursive: true });
 
-      let pipeline = sharp(img.path);
+        let pipeline = sharp(file.path);
 
-      if ((maxWidth as number) > 0) {
-        pipeline = pipeline.resize(maxWidth as number, null, {
-          withoutEnlargement: true,
-        });
+        if ((maxWidth as number) > 0) {
+          pipeline = pipeline.resize(maxWidth as number, null, {
+            withoutEnlargement: true,
+          });
+        }
+
+        await pipeline.webp({ quality: 75 }).toFile(outputPath);
+
+        const outputStat = await stat(outputPath);
+        totalOriginal += file.size;
+        totalCompressed += outputStat.size;
+
+        const saved = ((1 - outputStat.size / file.size) * 100).toFixed(0);
+        p.log.success(`→ ${formatBytes(outputStat.size)} (${saved}% smaller)`);
+      } else {
+        const outputRelative = file.relativePath.replace(/\.[^.]+$/, ".mp4");
+        const outputPath = join(outputDir, outputRelative);
+        await mkdir(dirname(outputPath), { recursive: true });
+
+        await compressVideo(file.path, outputPath, maxWidth as number);
+
+        const outputStat = await stat(outputPath);
+        totalOriginal += file.size;
+        totalCompressed += outputStat.size;
+
+        const saved = ((1 - outputStat.size / file.size) * 100).toFixed(0);
+        p.log.success(`→ ${formatBytes(outputStat.size)} (${saved}% smaller)`);
       }
-
-      await pipeline.webp({ quality: 75 }).toFile(outputPath);
-
-      const outputStat = await stat(outputPath);
-      totalOriginal += img.size;
-      totalCompressed += outputStat.size;
-
-      const saved = ((1 - outputStat.size / img.size) * 100).toFixed(0);
-      p.log.success(`→ ${formatBytes(outputStat.size)} (${saved}% smaller)`);
     }
   }
 
