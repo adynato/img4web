@@ -1,6 +1,8 @@
 #!/usr/bin/env bun
 import * as p from "@clack/prompts";
 import sharp from "sharp";
+import ffmpegPath from "ffmpeg-static";
+import ffprobePath from "ffprobe-static";
 import { readdir, stat, mkdir } from "fs/promises";
 import { join, basename, extname, dirname, relative } from "path";
 import { $ } from "bun";
@@ -57,7 +59,7 @@ async function findMedia(dir: string, baseDir: string): Promise<MediaFile[]> {
 
 async function getVideoDimensions(path: string): Promise<{ width: number; height: number }> {
   try {
-    const result = await $`ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 ${path}`.text();
+    const result = await $`${ffprobePath.path} -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 ${path}`.text();
     const [width, height] = result.trim().split("x").map(Number);
     return { width: width || 0, height: height || 0 };
   } catch {
@@ -66,12 +68,16 @@ async function getVideoDimensions(path: string): Promise<{ width: number; height
 }
 
 async function compressVideo(inputPath: string, outputPath: string, maxWidth?: number): Promise<void> {
-  const scaleFilter = maxWidth && maxWidth > 0
-    ? `-vf "scale='min(${maxWidth},iw)':-2"`
-    : "";
+  const args = ["-y", "-i", inputPath, "-c:v", "libx264", "-crf", "28", "-preset", "fast", "-c:a", "aac", "-b:a", "128k"];
+
+  if (maxWidth && maxWidth > 0) {
+    args.push("-vf", `scale='min(${maxWidth},iw)':-2`);
+  }
+
+  args.push(outputPath);
 
   // CRF 28 is good balance for web, -preset fast for speed
-  await $`ffmpeg -y -i ${inputPath} -c:v libx264 -crf 28 -preset fast -c:a aac -b:a 128k ${scaleFilter.length ? scaleFilter.split(" ") : []} ${outputPath}`.quiet();
+  await $`${ffmpegPath} ${args}`.quiet();
 }
 
 function formatBytes(bytes: number): string {
@@ -82,14 +88,6 @@ function formatBytes(bytes: number): string {
 
 async function main() {
   p.intro("img4web");
-
-  // Check for ffmpeg
-  let hasFFmpeg = true;
-  try {
-    await $`which ffmpeg`.quiet();
-  } catch {
-    hasFFmpeg = false;
-  }
 
   const input = await p.text({
     message: "Drop a folder",
@@ -128,11 +126,6 @@ async function main() {
 
   const images = allMedia.filter((m) => m.type === "image");
   const videos = allMedia.filter((m) => m.type === "video");
-
-  if (videos.length > 0 && !hasFFmpeg) {
-    p.log.warn(`Found ${videos.length} videos but ffmpeg not installed - skipping videos`);
-    videos.length = 0;
-  }
 
   // Get dimensions for images
   for (const img of images) {

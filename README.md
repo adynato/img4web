@@ -8,12 +8,6 @@ Drop a folder of images and videos, get web-ready assets.
 bun install
 ```
 
-For video support, install ffmpeg:
-
-```bash
-brew install ffmpeg
-```
-
 ## Usage
 
 ```bash
