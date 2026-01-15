@@ -20,6 +20,65 @@ interface MediaFile {
   height?: number;
 }
 
+interface Logger {
+  info: (msg: string) => void;
+  error: (msg: string) => void;
+  success: (msg: string) => void;
+  progress: (msg: string) => void;
+  done: () => void;
+}
+
+function createLogger(cli: boolean): Logger {
+  if (cli) {
+    return {
+      info: (msg) => console.log(msg),
+      error: (msg) => console.error(`Error: ${msg}`),
+      success: (msg) => console.log(msg),
+      progress: (msg) => process.stdout.write(`\r${msg}`),
+      done: () => console.log(),
+    };
+  }
+
+  const spinner = p.spinner();
+  let spinnerStarted = false;
+
+  return {
+    info: (msg) => p.log.info(msg),
+    error: (msg) => p.log.error(msg),
+    success: (msg) => p.log.success(msg),
+    progress: (msg) => {
+      if (!spinnerStarted) {
+        spinner.start(msg);
+        spinnerStarted = true;
+      } else {
+        spinner.message(msg);
+      }
+    },
+    done: () => {
+      if (spinnerStarted) spinner.stop("Done!");
+    },
+  };
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function normalizePath(input: string): string {
+  return input.trim().replace(/\\ /g, " ").replace(/\/$/, "");
+}
+
+async function verifyFolder(folderPath: string): Promise<boolean> {
+  try {
+    const s = await stat(folderPath);
+    return s.isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 async function findMedia(dir: string, baseDir: string): Promise<MediaFile[]> {
   const media: MediaFile[] = [];
   const entries = await readdir(dir, { withFileTypes: true });
@@ -28,27 +87,20 @@ async function findMedia(dir: string, baseDir: string): Promise<MediaFile[]> {
     const fullPath = join(dir, entry.name);
 
     if (entry.isDirectory()) {
-      const subMedia = await findMedia(fullPath, baseDir);
-      media.push(...subMedia);
+      media.push(...(await findMedia(fullPath, baseDir)));
     } else {
       const ext = extname(entry.name).toLowerCase();
       const fileStat = await stat(fullPath);
+      const isImage = IMAGE_EXTS.includes(ext);
+      const isVideo = VIDEO_EXTS.includes(ext);
 
-      if (IMAGE_EXTS.includes(ext)) {
+      if (isImage || isVideo) {
         media.push({
           path: fullPath,
           name: entry.name,
           relativePath: relative(baseDir, fullPath),
           size: fileStat.size,
-          type: "image"
-        });
-      } else if (VIDEO_EXTS.includes(ext)) {
-        media.push({
-          path: fullPath,
-          name: entry.name,
-          relativePath: relative(baseDir, fullPath),
-          size: fileStat.size,
-          type: "video"
+          type: isImage ? "image" : "video",
         });
       }
     }
@@ -67,33 +119,63 @@ async function getVideoDimensions(path: string): Promise<{ width: number; height
   }
 }
 
-async function compressVideo(inputPath: string, outputPath: string, maxWidth?: number): Promise<void> {
-  const args = ["-y", "-i", inputPath, "-c:v", "libx264", "-crf", "28", "-preset", "fast", "-c:a", "aac", "-b:a", "128k"];
+async function compressImage(inputPath: string, outputPath: string, maxWidth?: number): Promise<void> {
+  await mkdir(dirname(outputPath), { recursive: true });
 
+  let pipeline = sharp(inputPath);
+  if (maxWidth && maxWidth > 0) {
+    pipeline = pipeline.resize(maxWidth, null, { withoutEnlargement: true });
+  }
+  await pipeline.webp({ quality: 75 }).toFile(outputPath);
+}
+
+async function compressVideo(inputPath: string, outputPath: string, maxWidth?: number): Promise<void> {
+  await mkdir(dirname(outputPath), { recursive: true });
+
+  const args = ["-y", "-i", inputPath, "-c:v", "libx264", "-crf", "28", "-preset", "fast", "-c:a", "aac", "-b:a", "128k"];
   if (maxWidth && maxWidth > 0) {
     args.push("-vf", `scale='min(${maxWidth},iw)':-2`);
   }
-
   args.push(outputPath);
 
-  // CRF 28 is good balance for web, -preset fast for speed
   await $`${ffmpegPath} ${args}`.quiet();
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+async function processFile(file: MediaFile, outputDir: string, maxWidth?: number): Promise<number> {
+  const ext = file.type === "image" ? ".webp" : ".mp4";
+  const outputRelative = file.relativePath.replace(/\.[^.]+$/, ext);
+  const outputPath = join(outputDir, outputRelative);
+
+  if (file.type === "image") {
+    await compressImage(file.path, outputPath, maxWidth);
+  } else {
+    await compressVideo(file.path, outputPath, maxWidth);
+  }
+
+  const outputStat = await stat(outputPath);
+  return outputStat.size;
 }
 
-async function main() {
+async function getFolderFromCli(): Promise<string | null> {
+  const cliPath = process.argv[2];
+  if (!cliPath) return null;
+
+  const folderPath = normalizePath(cliPath);
+  if (!(await verifyFolder(folderPath))) {
+    console.error("Error: Invalid folder path");
+    process.exit(1);
+  }
+  return folderPath;
+}
+
+async function getFolderInteractive(): Promise<string> {
   p.intro("img4web");
 
   const input = await p.text({
     message: "Drop a folder",
     placeholder: "drag & drop here, then press enter",
     validate: (val) => {
-      if (!val || val.trim() === "") return "Please provide a path";
+      if (!val?.trim()) return "Please provide a path";
     },
   });
 
@@ -102,50 +184,15 @@ async function main() {
     process.exit(0);
   }
 
-  const folderPath = (input as string).trim().replace(/\\ /g, " ").replace(/\/$/, "");
-  const folderName = basename(folderPath);
-
-  // Verify it's a directory
-  try {
-    const s = await stat(folderPath);
-    if (!s.isDirectory()) {
-      p.log.error("Please provide a folder, not a file");
-      process.exit(1);
-    }
-  } catch {
-    p.log.error("Folder not found");
+  const folderPath = normalizePath(input as string);
+  if (!(await verifyFolder(folderPath))) {
+    p.log.error("Invalid folder path");
     process.exit(1);
   }
+  return folderPath;
+}
 
-  const allMedia = await findMedia(folderPath, folderPath);
-
-  if (allMedia.length === 0) {
-    p.log.error("No images or videos found");
-    process.exit(1);
-  }
-
-  const images = allMedia.filter((m) => m.type === "image");
-  const videos = allMedia.filter((m) => m.type === "video");
-
-  // Get dimensions for images
-  for (const img of images) {
-    const metadata = await sharp(img.path).metadata();
-    img.width = metadata.width;
-    img.height = metadata.height;
-  }
-
-  // Get dimensions for videos
-  for (const vid of videos) {
-    const dims = await getVideoDimensions(vid.path);
-    vid.width = dims.width;
-    vid.height = dims.height;
-  }
-
-  const totalSize = allMedia.reduce((sum, m) => sum + m.size, 0);
-  const mediaToProcess = [...images, ...videos];
-
-  p.log.info(`Found ${images.length} images, ${videos.length} videos (${formatBytes(totalSize)})`);
-
+async function getModeInteractive(): Promise<"fast" | "custom"> {
   const mode = await p.select({
     message: "Mode",
     options: [
@@ -158,120 +205,98 @@ async function main() {
     p.cancel("Cancelled");
     process.exit(0);
   }
+  return mode as "fast" | "custom";
+}
 
-  // Create output folder next to input
-  const outputDir = join(dirname(folderPath), `${folderName}-compressed`);
+async function getMaxWidthInteractive(file: MediaFile): Promise<number> {
+  p.log.info(`\n${file.relativePath} - ${file.width}x${file.height} (${formatBytes(file.size)}) [${file.type}]`);
+
+  const maxWidth = await p.select({
+    message: "Max width",
+    options: [
+      { value: 0, label: `Keep original (${file.width}px)` },
+      { value: 400, label: "400px (thumbnail)" },
+      { value: 800, label: "800px (small)" },
+      { value: 1200, label: "1200px (medium)" },
+      { value: 1920, label: "1920px (large)" },
+      { value: 2560, label: "2560px (retina)" },
+    ],
+  });
+
+  if (p.isCancel(maxWidth)) {
+    p.cancel("Cancelled");
+    process.exit(0);
+  }
+  return maxWidth as number;
+}
+
+async function loadDimensions(media: MediaFile[]): Promise<void> {
+  for (const file of media) {
+    if (file.type === "image") {
+      const metadata = await sharp(file.path).metadata();
+      file.width = metadata.width;
+      file.height = metadata.height;
+    } else {
+      const dims = await getVideoDimensions(file.path);
+      file.width = dims.width;
+      file.height = dims.height;
+    }
+  }
+}
+
+async function main() {
+  const cliFolder = await getFolderFromCli();
+  const isCliMode = !!cliFolder;
+  const folderPath = cliFolder ?? (await getFolderInteractive());
+  const log = createLogger(isCliMode);
+
+  const allMedia = await findMedia(folderPath, folderPath);
+  if (allMedia.length === 0) {
+    log.error("No images or videos found");
+    process.exit(1);
+  }
+
+  const images = allMedia.filter((m) => m.type === "image");
+  const videos = allMedia.filter((m) => m.type === "video");
+  const totalSize = allMedia.reduce((sum, m) => sum + m.size, 0);
+
+  log.info(`Found ${images.length} images, ${videos.length} videos (${formatBytes(totalSize)})`);
+
+  const mode = isCliMode ? "fast" : await getModeInteractive();
+  if (mode === "custom") await loadDimensions(allMedia);
+
+  const outputDir = join(dirname(folderPath), `${basename(folderPath)}-compressed`);
   await mkdir(outputDir, { recursive: true });
 
   let totalOriginal = 0;
   let totalCompressed = 0;
 
-  if (mode === "fast") {
-    const spinner = p.spinner();
-    spinner.start("Processing...");
+  for (let i = 0; i < allMedia.length; i++) {
+    const file = allMedia[i]!;
+    const maxWidth = mode === "custom" ? await getMaxWidthInteractive(file) : undefined;
 
-    for (let i = 0; i < mediaToProcess.length; i++) {
-      const file = mediaToProcess[i]!;
-      spinner.message(`${file.name} (${i + 1}/${mediaToProcess.length})`);
+    log.progress(`${file.name} (${i + 1}/${allMedia.length})`);
 
-      if (file.type === "image") {
-        const outputRelative = file.relativePath.replace(/\.[^.]+$/, ".webp");
-        const outputPath = join(outputDir, outputRelative);
-        await mkdir(dirname(outputPath), { recursive: true });
+    const compressedSize = await processFile(file, outputDir, maxWidth);
+    totalOriginal += file.size;
+    totalCompressed += compressedSize;
 
-        await sharp(file.path)
-          .webp({ quality: 75 })
-          .toFile(outputPath);
-
-        const outputStat = await stat(outputPath);
-        totalOriginal += file.size;
-        totalCompressed += outputStat.size;
-      } else {
-        const outputRelative = file.relativePath.replace(/\.[^.]+$/, ".mp4");
-        const outputPath = join(outputDir, outputRelative);
-        await mkdir(dirname(outputPath), { recursive: true });
-
-        await compressVideo(file.path, outputPath);
-
-        const outputStat = await stat(outputPath);
-        totalOriginal += file.size;
-        totalCompressed += outputStat.size;
-      }
-    }
-
-    spinner.stop("Done!");
-  } else {
-    // Custom mode - ask per file
-    for (let i = 0; i < mediaToProcess.length; i++) {
-      const file = mediaToProcess[i]!;
-
-      p.log.info(`\n${file.relativePath} - ${file.width}x${file.height} (${formatBytes(file.size)}) [${file.type}]`);
-
-      const maxWidth = await p.select({
-        message: "Max width",
-        options: [
-          { value: 0, label: `Keep original (${file.width}px)` },
-          { value: 400, label: "400px (thumbnail)" },
-          { value: 800, label: "800px (small)" },
-          { value: 1200, label: "1200px (medium)" },
-          { value: 1920, label: "1920px (large)" },
-          { value: 2560, label: "2560px (retina)" },
-        ],
-      });
-
-      if (p.isCancel(maxWidth)) {
-        p.cancel("Cancelled");
-        process.exit(0);
-      }
-
-      if (file.type === "image") {
-        const outputRelative = file.relativePath.replace(/\.[^.]+$/, ".webp");
-        const outputPath = join(outputDir, outputRelative);
-        await mkdir(dirname(outputPath), { recursive: true });
-
-        let pipeline = sharp(file.path);
-
-        if ((maxWidth as number) > 0) {
-          pipeline = pipeline.resize(maxWidth as number, null, {
-            withoutEnlargement: true,
-          });
-        }
-
-        await pipeline.webp({ quality: 75 }).toFile(outputPath);
-
-        const outputStat = await stat(outputPath);
-        totalOriginal += file.size;
-        totalCompressed += outputStat.size;
-
-        const saved = ((1 - outputStat.size / file.size) * 100).toFixed(0);
-        p.log.success(`→ ${formatBytes(outputStat.size)} (${saved}% smaller)`);
-      } else {
-        const outputRelative = file.relativePath.replace(/\.[^.]+$/, ".mp4");
-        const outputPath = join(outputDir, outputRelative);
-        await mkdir(dirname(outputPath), { recursive: true });
-
-        await compressVideo(file.path, outputPath, maxWidth as number);
-
-        const outputStat = await stat(outputPath);
-        totalOriginal += file.size;
-        totalCompressed += outputStat.size;
-
-        const saved = ((1 - outputStat.size / file.size) * 100).toFixed(0);
-        p.log.success(`→ ${formatBytes(outputStat.size)} (${saved}% smaller)`);
-      }
+    if (mode === "custom") {
+      const saved = ((1 - compressedSize / file.size) * 100).toFixed(0);
+      log.success(`→ ${formatBytes(compressedSize)} (${saved}% smaller)`);
     }
   }
 
-  const savings = totalOriginal - totalCompressed;
-  const percent = ((savings / totalOriginal) * 100).toFixed(0);
+  log.done();
 
-  p.log.success(`${formatBytes(totalOriginal)} → ${formatBytes(totalCompressed)} (${percent}% smaller)`);
-  p.log.info(`Output: ${outputDir}`);
+  const percent = ((1 - totalCompressed / totalOriginal) * 100).toFixed(0);
+  log.success(`${formatBytes(totalOriginal)} → ${formatBytes(totalCompressed)} (${percent}% smaller)`);
+  log.info(`Output: ${outputDir}`);
 
-  p.outro("Done!");
+  if (!isCliMode) p.outro("Done!");
 }
 
 main().catch((err) => {
-  p.log.error(err.message);
+  console.error(err.message);
   process.exit(1);
 });

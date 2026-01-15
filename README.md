@@ -10,6 +10,8 @@ bun install
 
 ## Usage
 
+### Interactive mode
+
 ```bash
 bun start
 ```
@@ -19,6 +21,14 @@ bun start
    - **Fast** - compress only, keep original dimensions
    - **Custom** - set max width per file
 3. Get `{folder}-compressed/` next to your input
+
+### CLI mode
+
+```bash
+bun start /path/to/folder
+```
+
+Runs in fast mode (compress only, keep dimensions). Output goes to `{folder}-compressed/`.
 
 ## What it does
 
